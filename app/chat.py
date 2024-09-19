@@ -11,6 +11,8 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import PyPDFLoader, CSVLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+import logging
+import fitz  # PyMuPDF
 
 # Load environment variables from .env file
 load_dotenv()
@@ -30,6 +32,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 vector_store = None
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 def embed_text(text: str):
     embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
     
@@ -46,11 +52,23 @@ def embed_text(text: str):
         raise ValueError("Input must be a string or a list of strings.")  # Added error handling
 
 # Updated function to fetch and process the file
-def fetch_file_content(file_url: str):
+def fetch_file_content(file_url: str, file_type: str):
     try:
         response = requests.get(file_url)
         response.raise_for_status()  # Raises HTTPError for bad responses
-        return response.content.decode('utf-8')  # Ensure content is decoded to string
+
+        if file_type == "application/pdf":
+            # Save the file content to a temporary file and load it
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                tmp_file.write(response.content)  # Write bytes directly
+                tmp_file.flush()
+                return tmp_file.name  # Return the file path
+
+        elif file_type == "text/csv":
+            return response.content.decode('utf-8')  # Ensure content is decoded to string
+
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file format.")
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch file: {str(e)}")
 
@@ -62,6 +80,7 @@ def initialize_vector_store():
     if vector_store is not None:
         return
 
+    logger.info("Fetching files from external API")
     # Fetch files from the external API
     response = requests.get(FETCH_FILES_URL)
     if response.status_code != 200:
@@ -76,27 +95,24 @@ def initialize_vector_store():
     file_url = latest_file['url']
     file_type = latest_file['type']
 
+    logger.info(f"Downloading file content from {file_url}")
     # Download the file content
-    file_content = fetch_file_content(file_url)
+    file_content = fetch_file_content(file_url, file_type)
 
     # Process the file based on its type (PDF, CSV)
     if file_type == "application/pdf":
-        # Save the file content to a temporary file and load it
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            tmp_file.write(file_content.encode('utf-8'))  # Ensure content is encoded to bytes
-            tmp_file.flush()
-            loader = PyPDFLoader(tmp_file.name)
+        loader = PyPDFLoader(file_content)  # Use the file path for PyPDFLoader
 
     elif file_type == "text/csv":
         loader = CSVLoader(file_content)  # Directly use the decoded content
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported file format.")
 
+    logger.info("Loading and splitting the text")
     # Load and split the text
     documents = loader.load()
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=50)
     docs = text_splitter.split_documents(documents)
 
+    logger.info("Creating embeddings and initializing the vector store")
     # Create embeddings and initialize the vector store
     embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
     vector_store = FAISS.from_documents(docs, embeddings)
@@ -187,5 +203,5 @@ async def chat_with_bot(request: ChatRequest):
         return {"response": openai_response, "flagged": censored_input != user_input, "document_answer": document_response}
 
     except Exception as e:
-        print(f"Error: {str(e)}")
+        logger.error(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
