@@ -42,13 +42,15 @@ def embed_text(text: str):
     elif isinstance(text, list):
         vectors = [embeddings.embed_query(t) for t in text]  # Return directly without .tolist()
         return vectors
+    else:
+        raise ValueError("Input must be a string or a list of strings.")  # Added error handling
 
 # Updated function to fetch and process the file
 def fetch_file_content(file_url: str):
     try:
         response = requests.get(file_url)
         response.raise_for_status()  # Raises HTTPError for bad responses
-        return response.content
+        return response.content.decode('utf-8')  # Ensure content is decoded to string
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch file: {str(e)}")
 
@@ -81,12 +83,12 @@ def initialize_vector_store():
     if file_type == "application/pdf":
         # Save the file content to a temporary file and load it
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            tmp_file.write(file_content)
+            tmp_file.write(file_content.encode('utf-8'))  # Ensure content is encoded to bytes
             tmp_file.flush()
             loader = PyPDFLoader(tmp_file.name)
 
     elif file_type == "text/csv":
-        loader = CSVLoader(file_content.decode('utf-8'))  # Assuming it's UTF-8 encoded CSV content
+        loader = CSVLoader(file_content)  # Directly use the decoded content
     else:
         raise HTTPException(status_code=400, detail="Unsupported file format.")
 
