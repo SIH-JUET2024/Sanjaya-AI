@@ -2,11 +2,12 @@ from fastapi import APIRouter, HTTPException
 from typing import List
 import requests
 import openai
-from app.utils import extract_text_from_file, embed_text, cosine_similarity
+from app.utils import extract_text_from_file, cosine_similarity
 import os
+import tempfile
 from dotenv import load_dotenv
 from pydantic import BaseModel
-from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import PyPDFLoader, CSVLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -25,11 +26,24 @@ FETCH_FILES_URL = os.getenv("GET_FILES_URL")
 
 # OpenAI API key (ensure it's stored in a safe environment)
 openai.api_key = os.getenv("OPENAI_API_KEY")
-# It has been stored in two variables due to an error.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 vector_store = None
 
+def embed_text(text: str):
+    embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
+    
+    # If the input is a single string, embed it as usual
+    if isinstance(text, str):
+        vector = embeddings.embed_query(text)
+        return vector  # Return directly as it's already a list
+    
+    # If the input is a list, embed each string
+    elif isinstance(text, list):
+        vectors = [embeddings.embed_query(t) for t in text]  # Return directly without .tolist()
+        return vectors
+
+# Updated function to fetch and process the file
 def fetch_file_content(file_url: str):
     try:
         response = requests.get(file_url)
@@ -38,7 +52,7 @@ def fetch_file_content(file_url: str):
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch file: {str(e)}")
 
-## Function to initialize the vector store
+# Function to initialize the vector store
 def initialize_vector_store():
     global vector_store
 
@@ -65,9 +79,14 @@ def initialize_vector_store():
 
     # Process the file based on its type (PDF, CSV)
     if file_type == "application/pdf":
-        loader = PyPDFLoader(file_content)
+        # Save the file content to a temporary file and load it
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(file_content)
+            tmp_file.flush()
+            loader = PyPDFLoader(tmp_file.name)
+
     elif file_type == "text/csv":
-        loader = CSVLoader(file_content)
+        loader = CSVLoader(file_content.decode('utf-8'))  # Assuming it's UTF-8 encoded CSV content
     else:
         raise HTTPException(status_code=400, detail="Unsupported file format.")
 
@@ -79,7 +98,6 @@ def initialize_vector_store():
     # Create embeddings and initialize the vector store
     embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
     vector_store = FAISS.from_documents(docs, embeddings)
-
 
 # Get bad words list from API
 def get_bad_words() -> List[str]:
@@ -117,28 +135,30 @@ def censor_bad_words(user_input: str) -> str:
 # Function to interact with OpenAI API
 def get_openai_response(prompt: str) -> str:
     response = openai.Completion.create(
-        model="gpt-3.5",
-        prompt=prompt,
+        model="gpt-3.5-turbo",  # Use the proper model name
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt}
+        ],
         max_tokens=150
     )
-    return response.choices[0].text.strip()
+    return response.choices[0].message['content'].strip()  # Updated to retrieve message
 
 # Function to find the best matching document text using vector similarity
 def query_documents(query: str):
     if not vector_store:
         raise HTTPException(status_code=404, detail="No documents uploaded for querying.")
     
-    query_embedding = embed_text(query)
-    best_match = None
-    best_score = -1
+    query_embedding = embed_text(query)  # Get the embedding
 
-    for doc in vector_store:
-        similarity_score = cosine_similarity(query_embedding, doc['embedding'])
-        if similarity_score > best_score:
-            best_score = similarity_score
-            best_match = doc
+    # Perform similarity search
+    docs = vector_store.similarity_search(query_embedding, k=5)  # Directly pass the embedding (no tolist())
 
-    return best_match['text'] if best_match else None
+    if not docs:
+        return None
+
+    # Return the best matching document
+    return docs[0].page_content if docs else None
 
 # Define a request body model
 class ChatRequest(BaseModel):
@@ -162,21 +182,8 @@ async def chat_with_bot(request: ChatRequest):
         prompt = f"User query: {censored_input}. Relevant document content: {document_response if document_response else 'No document found.'}. Provide an answer based on this information."
         openai_response = get_openai_response(prompt)
 
-        # Get documents from vector store
-        docs = vector_store.similarity_search(censored_input, k=5)
-        context = "\n".join([doc.page_content for doc in docs])
-        response = openai.Completion.create(
-            engine="gpt-3.5",
-            prompt=f"Context: {context}\n\nUser Query: {censored_input}\n\nProvide a detailed response:",
-            max_tokens=300,
-            temperature=0.5,
-        )
-
-        answer = response.choices[0].text.strip()
-        return {"response": openai_response, "flagged": censored_input != user_input, "document_answer": answer}
+        return {"response": openai_response, "flagged": censored_input != user_input, "document_answer": document_response}
 
     except Exception as e:
-        # Log error details for debugging
         print(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
-
