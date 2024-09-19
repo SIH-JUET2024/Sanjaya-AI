@@ -5,6 +5,7 @@ openai
 faiss-cpu 
 pydantic 
 PyPDF2
+PyMuPDF
 python-dotenv
 google-ai-generativelanguage
 google-api-core
@@ -17,3 +18,6 @@ google-cloud-speech
 google-cloud-texttospeech
 fitz
 textract
+langchain-community
+python-multipart
+pypdf

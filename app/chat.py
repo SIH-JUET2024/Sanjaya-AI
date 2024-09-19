@@ -5,10 +5,11 @@ import openai
 from app.utils import extract_text_from_file, embed_text, cosine_similarity
 import os
 from dotenv import load_dotenv
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
+from pydantic import BaseModel
+from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import PyPDFLoader, CSVLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.document_loaders import PyPDFLoader, DocxLoader, CSVLoader
 
 # Load environment variables from .env file
 load_dotenv()
@@ -27,8 +28,58 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 # It has been stored in two variables due to an error.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Vector store (simple in-memory storage for this example)
-vector_store = []
+vector_store = None
+
+def fetch_file_content(file_url: str):
+    try:
+        response = requests.get(file_url)
+        response.raise_for_status()  # Raises HTTPError for bad responses
+        return response.content
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch file: {str(e)}")
+
+## Function to initialize the vector store
+def initialize_vector_store():
+    global vector_store
+
+    # Check if vector_store is already initialized
+    if vector_store is not None:
+        return
+
+    # Fetch files from the external API
+    response = requests.get(FETCH_FILES_URL)
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail="Failed to fetch files.")
+
+    files = response.json()
+    if not files:
+        raise HTTPException(status_code=404, detail="No files found.")
+
+    # Get the latest file by ID
+    latest_file = max(files, key=lambda x: x['id'])
+    file_url = latest_file['url']
+    file_type = latest_file['type']
+
+    # Download the file content
+    file_content = fetch_file_content(file_url)
+
+    # Process the file based on its type (PDF, CSV)
+    if file_type == "application/pdf":
+        loader = PyPDFLoader(file_content)
+    elif file_type == "text/csv":
+        loader = CSVLoader(file_content)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported file format.")
+
+    # Load and split the text
+    documents = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=50)
+    docs = text_splitter.split_documents(documents)
+
+    # Create embeddings and initialize the vector store
+    embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
+    vector_store = FAISS.from_documents(docs, embeddings)
+
 
 # Get bad words list from API
 def get_bad_words() -> List[str]:
@@ -89,69 +140,31 @@ def query_documents(query: str):
 
     return best_match['text'] if best_match else None
 
-# Chatbot endpoint
+# Define a request body model
+class ChatRequest(BaseModel):
+    user_input: str
+
+# Refactor the chat endpoint to ensure vector store is initialized before querying
 @chat_router.post("/chat")
-async def chat_with_bot(user_input: str):
+async def chat_with_bot(request: ChatRequest):
+    user_input = request.user_input
     global vector_store
     try:
         # Censor bad words and flag them
         censored_input = censor_bad_words(user_input)
 
-        # Check if the user is querying a document
+        # Initialize vector store if needed
+        if vector_store is None:
+            initialize_vector_store()
+
+        # Query documents and get response
         document_response = query_documents(censored_input)
-
-        if document_response:
-            prompt = f"User query: {censored_input}. Relevant document content: {document_response}. Provide an answer based on this information."
-        else:
-            prompt = f"User query: {censored_input}. Provide a helpful response."
-
-        # Get response from OpenAI
+        prompt = f"User query: {censored_input}. Relevant document content: {document_response if document_response else 'No document found.'}. Provide an answer based on this information."
         openai_response = get_openai_response(prompt)
 
-        # If no vector store is available, process the latest file
-        if vector_store is None:
-            response = requests.get(FETCH_FILES_URL)
-            if response.status_code != 200:
-                raise HTTPException(status_code=response.status_code, detail="Failed to fetch files.")
-
-            files = response.json()
-            if not files:
-                raise HTTPException(status_code=404, detail="No files found.")
-
-            # Get the file with the highest ID
-            latest_file = max(files, key=lambda x: x['id'])
-            file_url = latest_file['url']
-            file_type = latest_file['type']
-
-            # Download the file content
-            file_content = requests.get(file_url).content
-
-            # Process the file based on its type (PDF, DOCX, CSV)
-            if file_type == "application/pdf":
-                loader = PyPDFLoader(file_content)
-            elif file_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-                loader = DocxLoader(file_content)
-            elif file_type == "text/csv":
-                loader = CSVLoader(file_content)
-            else:
-                raise HTTPException(status_code=400, detail="Unsupported file format.")
-
-            # Load and split the text
-            documents = loader.load()
-            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=50)
-            docs = text_splitter.split_documents(documents)
-
-            # Create embeddings and store them in a vector store for fast querying
-            embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
-            vector_store = FAISS.from_documents(docs, embeddings)
-
-        # Query the vector store for relevant document snippets based on the user's question
-        docs = vector_store.similarity_search(censored_input, k=5)  # Get the top 5 most relevant results
-
-        # Format the retrieved document snippets and send the query to OpenAI for a response
+        # Get documents from vector store
+        docs = vector_store.similarity_search(censored_input, k=5)
         context = "\n".join([doc.page_content for doc in docs])
-
-        # Use OpenAI to generate the chatbot response based on the context
         response = openai.Completion.create(
             engine="gpt-3.5",
             prompt=f"Context: {context}\n\nUser Query: {censored_input}\n\nProvide a detailed response:",
@@ -163,4 +176,7 @@ async def chat_with_bot(user_input: str):
         return {"response": openai_response, "flagged": censored_input != user_input, "document_answer": answer}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Log error details for debugging
+        print(f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+

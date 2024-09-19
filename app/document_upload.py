@@ -1,9 +1,12 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException 
 import requests
 import os
 from dotenv import load_dotenv
 
 document_router = APIRouter()
+
+# Load environment variables
+load_dotenv()
 
 # Retrieve URLs from environment variables
 UPLOAD_URL = os.getenv("UPLOAD_URL")
@@ -13,6 +16,10 @@ DELETE_FILE_URL = os.getenv("DELETE_FILE_URL")
 @document_router.post("/upload-document")
 async def upload_document(file: UploadFile = File(...)):
     try:
+        # Ensure the file content type is valid
+        if not file.content_type in ["application/pdf", "text/csv"]:
+            raise HTTPException(status_code=400, detail="Only PDF and CSV files are supported.")
+
         # Send a POST request to the upload file API endpoint with form data
         files = {'file': (file.filename, file.file, file.content_type)}
         response = requests.post(UPLOAD_URL, files=files)
