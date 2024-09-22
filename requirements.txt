@@ -21,3 +21,4 @@ textract
 langchain-community
 python-multipart
 pypdf
+textract==1.6.3
