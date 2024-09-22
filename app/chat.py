@@ -101,7 +101,56 @@ def initialize_vector_store():
     embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
     vector_store = FAISS.from_documents(docs, embeddings)
 
-# The rest of the functions (get_bad_words, flag_bad_word, censor_bad_words, get_openai_response, query_documents) remain the same
+def get_bad_words() -> List[str]:
+    response = requests.get(GET_BADWORDS_URL)
+    if response.status_code == 200:
+        badwords_data = response.json()
+        return [word['word'] for word in badwords_data]
+    else:
+        raise HTTPException(status_code=response.status_code, detail="Failed to retrieve bad words.")
+
+def flag_bad_word(word: str):
+    payload = {"word": word}
+    response = requests.post(ADD_FLAGGED_WORD_URL, json=payload)
+    if response.status_code != 200:
+        raise HTTPException(status_code=response.status_code, detail="Failed to flag bad word.")
+
+def censor_bad_words(user_input: str) -> str:
+    bad_words = get_bad_words()
+    censored_input = user_input.lower()
+    flagged_words = set()
+
+    for word in bad_words:
+        if word.lower() in censored_input:
+            censored_input = censored_input.replace(word.lower(), "***")
+            flagged_words.add(word)
+
+    for word in flagged_words:
+        flag_bad_word(word)
+
+    return censored_input
+
+def get_openai_response(prompt: str) -> str:
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=150
+        )
+        return response.choices[0].message['content'].strip()
+    except openai.error.OpenAIError as e:
+        raise HTTPException(status_code=500, detail=f"OpenAI API error: {str(e)}")
+
+def query_documents(query: str):
+    if not vector_store:
+        raise HTTPException(status_code=404, detail="No documents uploaded for querying.")
+    
+    query_embedding = embed_text(query)
+    docs = vector_store.similarity_search(query_embedding, k=5)
+    return docs[0].page_content if docs else None
 
 @chat_router.post("/chat")
 async def chat_with_bot(request: ChatRequest):
